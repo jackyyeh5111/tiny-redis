@@ -8,9 +8,16 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var port string = "6359"
+
+// Define Global Storage and Mutex for Thread-Safety
+var (
+	store = make(map[string]string)
+	mu    sync.RWMutex
+)
 
 func main() {
 	listener, err := net.Listen("tcp", ":"+port)
@@ -68,40 +75,66 @@ func handleRequest(conn net.Conn) {
 }
 
 func handleArray(reader *bufio.Reader, conn net.Conn) {
-	// 2. Read length of the array
 	line, _ := reader.ReadString('\n')
 	count, _ := strconv.Atoi(strings.TrimSpace(line))
-	fmt.Printf("line: %s \nArray of %d elements received\n", line, count)
 
 	var args []string
 	for i := 0; i < count; i++ {
-		// Expecting Bulk Strings ($)
 		typeByte, _ := reader.ReadByte()
 		if typeByte == '$' {
-			// Read Bulk String length
 			line, _ := reader.ReadString('\n')
 			strLen, _ := strconv.Atoi(strings.TrimSpace(line))
 
-			// Read the actual string data
 			data := make([]byte, strLen)
 			io.ReadFull(reader, data)
-
-			// Consume the trailing \r\n
-			reader.ReadString('\n')
+			reader.ReadString('\n') // consume CRLF
 
 			args = append(args, string(data))
 		}
-
-		// TODO: Handle other types within the array if needed
 	}
 
-	// 3. Simple Command Logic
 	if len(args) > 0 {
 		command := strings.ToUpper(args[0])
-		if command == "PING" {
+
+		switch command {
+		case "PING":
 			conn.Write([]byte("+PONG\r\n"))
-		} else {
-			conn.Write([]byte("-ERR unknown command\r\n"))
+
+		case "SET":
+			if len(args) != 3 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'set' command\r\n"))
+				return
+			}
+			key, value := args[1], args[2]
+
+			mu.Lock() // Lock for writing
+			store[key] = value
+			mu.Unlock()
+
+			conn.Write([]byte("+OK\r\n"))
+
+		case "GET":
+			if len(args) != 2 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'get' command\r\n"))
+				return
+			}
+			key := args[1]
+
+			mu.RLock() // Lock for reading (multiple readers allowed)
+			value, exists := store[key]
+			mu.RUnlock()
+
+			if !exists {
+				// Nil Bulk String response in RESP
+				conn.Write([]byte("$-1\r\n"))
+			} else {
+				// Bulk String response: $[len]\r\n[value]\r\n
+				response := fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)
+				conn.Write([]byte(response))
+			}
+
+		default:
+			conn.Write([]byte("-ERR unknown command '" + command + "'\r\n"))
 		}
 	}
 }
